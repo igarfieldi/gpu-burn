@@ -110,7 +110,7 @@ void checkError(cublasStatus_t rCode, std::string desc = "") {
 		g_errorStrings[rCode];
 }
 
-bool g_running = false;
+std::atomic_bool g_running{ false };
 
 template <class T> class GPU_Test {
 public:
@@ -126,7 +126,7 @@ public:
 		checkError(cudaMallocHost(&d_faultyElemsHost, sizeof(int)));
 		d_error = 0;
 
-		g_running = true;
+		g_running.store(true);
 	}
 	~GPU_Test() {
 		checkError(cudaFree(d_Cdata), "Free A");
@@ -170,8 +170,10 @@ public:
 
 	void initBuffers(T* A, T* B) {
 		const std::size_t useBytes = static_cast<size_t>(static_cast<double>(availMemory()) * USEMEM);
-		printf("Initialized device %d with %zu MB of memory (%zu MB available, using %zu MB of it), %s%s\n",
-			   d_devNumber, totalMemory() / 1024ul / 1024ul, availMemory() / 1024ul / 1024ul, useBytes / 1024ul / 1024ul,
+		cudaDeviceProp props;
+		checkError(cudaGetDeviceProperties(&props, d_devNumber), "device properties");
+		printf("Initialized device %d (%s) with %zu MB of memory (%zu MB available, using %zu MB of it), %s%s\n",
+			   d_devNumber, props.name, totalMemory() / 1024ul / 1024ul, availMemory() / 1024ul / 1024ul, useBytes / 1024ul / 1024ul,
 			   d_doubles ? "using DOUBLES" : "using FLOATS", d_tensors ? ", using Tensor Cores" : "");
 		const std::size_t d_resultSize = sizeof(T) * SIZE * SIZE;
 		d_iters = (useBytes - 2 * d_resultSize) / d_resultSize; // We remove A and B sizes
@@ -226,7 +228,7 @@ public:
 	}
 
 	bool shouldRun() {
-		return g_running;
+		return g_running.load(std::memory_order_acquire);
 	}
 
 private:
@@ -321,7 +323,7 @@ void startBurn(int index, T* A, T* B, bool doubles, bool tensors) {
 
 
 template < class T >
-void launch(int runLength, bool useDoubles, bool useTensorCores) {
+void launch(std::chrono::seconds runLength, bool useDoubles, bool useTensorCores) {
 	// Initting A and B with random data
 	auto A = std::make_unique<T[]>(SIZE * SIZE);
 	auto B = std::make_unique<T[]>(SIZE * SIZE);
@@ -343,13 +345,12 @@ void launch(int runLength, bool useDoubles, bool useTensorCores) {
 		::nvmlDeviceGetHandleByIndex_v2(static_cast<unsigned>(d), &deviceHandles[d]);
 
 	// TODO: replace with condition variable?
-	std::atomic_bool running;
-	running.store(true);
+	g_running.store(true, std::memory_order_release);
 	// One thread per device as well as one for temperature updates
 	std::vector<std::thread> threads;
 	threads.reserve(static_cast<std::size_t>(deviceCount) + 1u);
-	threads.emplace_back([&running, &deviceHandles]() {
-		while(running) {
+	threads.emplace_back([&deviceHandles]() {
+		while(g_running.load(std::memory_order_acquire)) {
 			std::this_thread::sleep_for(TEMP_TIMEOUT);
 			printf("Device temps:");
 			for(std::size_t i = 0u; i < deviceHandles.size(); ++i) {
@@ -364,17 +365,19 @@ void launch(int runLength, bool useDoubles, bool useTensorCores) {
 	for(int d = 0; d < deviceCount; ++d)
 		threads.emplace_back(startBurn<T>, d, A.get(), B.get(), useDoubles, useTensorCores);
 
+	std::this_thread::sleep_for(runLength);
+	g_running.store(false, std::memory_order_release);
+
 	for(std::size_t i = 1u; i < threads.size(); ++i) {
 		if(threads[i].joinable())
 			threads[i].join();
 	}
-	running = false;
 	if(threads[0].joinable())
 		threads[0].join();
 }
 
 int main(int argc, char** argv) {
-	int runLength = 10;
+	std::chrono::seconds runLength{ 10 };
 	bool useDoubles = false;
 	bool useTensorCores = false;
 	int thisParam = 0;
@@ -394,7 +397,7 @@ int main(int argc, char** argv) {
 	if(argc - thisParam < 2)
 		printf("Run length not specified in the command line.  Burning for 10 secs\n");
 	else
-		runLength = atoi(argv[1 + thisParam]);
+		runLength = std::chrono::seconds{ atoi(argv[1 + thisParam]) };
 
 	const auto res = ::nvmlInit_v2();
 	if(res != NVML_SUCCESS) {
